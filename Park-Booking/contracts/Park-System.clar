@@ -131,7 +131,7 @@
       )
       (ok (* hours hourly-rate))
     )
-    (err ERR_SPOT_NOT_EXISTS)
+    ERR_SPOT_NOT_EXISTS
   )
 )
 
@@ -364,7 +364,7 @@
         (var-set next-reservation-id (+ reservation-id u1))
         (ok reservation-id)
       )
-      error-code error-code
+      error-code (err error-code)
     )
   )
 )
@@ -443,12 +443,13 @@
                 (map-set reservations { reservation-id: res-id }
                   (merge reservation { is-used: true })
                 )
+                true
               )
-              (err ERR_RESERVATION_NOT_EXISTS)
+              false
             )
-            (ok true)
+            true
           )
-          (ok true)
+          true
         )
         
         ;; Create parking session
@@ -476,7 +477,7 @@
         (ok session-id)
       )
     )
-    (err ERR_SPOT_NOT_EXISTS)
+    ERR_SPOT_NOT_EXISTS
   )
 )
 
@@ -551,18 +552,14 @@
               (update-user-stats tx-sender final-cost penalty)
               (update-spot-stats spot-id total-cost duration)
               
-              ;; Find and complete the parking session
-              ;; This is a simplified approach - in a real implementation,
-              ;; you might want to store the session-id with the spot
-              
               (ok { cost: final-cost, duration: duration, penalty: penalty })
             )
           )
-          error-code error-code
+          error-code (err error-code)
         )
       )
     )
-    (err ERR_SPOT_NOT_EXISTS)
+    ERR_SPOT_NOT_EXISTS
   )
 )
 
@@ -583,20 +580,20 @@
         )
         (ok true)
       )
-      (err ERR_SPOT_NOT_EXISTS)
+      ERR_SPOT_NOT_EXISTS
     )
   )
 )
 
 ;; Set base rates (contract owner only)
-(define-public (set-base-rates (hourly-rate uint) (penalty-rate uint))
+(define-public (set-base-rates (hourly-rate uint) (new-penalty-rate uint))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
     (asserts! (> hourly-rate u0) ERR_INVALID_PAYMENT)
-    (asserts! (> penalty-rate u0) ERR_INVALID_PAYMENT)
+    (asserts! (> new-penalty-rate u0) ERR_INVALID_PAYMENT)
     
     (var-set base-hourly-rate hourly-rate)
-    (var-set penalty-rate penalty-rate)
+    (var-set penalty-rate new-penalty-rate)
     (ok true)
   )
 )
