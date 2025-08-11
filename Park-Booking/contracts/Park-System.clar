@@ -16,6 +16,7 @@
 (define-constant ERR_SPOT_DISABLED (err u110))
 (define-constant ERR_ALREADY_CHECKED_OUT (err u111))
 (define-constant ERR_INVALID_SPOT_TYPE (err u112))
+(define-constant ERR_INVALID_INPUT (err u113))
 
 ;; Parking spot types
 (define-constant SPOT_TYPE_REGULAR u1)
@@ -173,6 +174,19 @@
 
 ;; Private functions
 
+;; Validate input parameters
+(define-private (validate-spot-id (spot-id uint))
+  (and (> spot-id u0) (<= spot-id u1000000))
+)
+
+(define-private (validate-reservation-id (reservation-id uint))
+  (and (> reservation-id u0) (<= reservation-id u1000000))
+)
+
+(define-private (validate-location (location (string-ascii 100)))
+  (and (> (len location) u0) (<= (len location) u100))
+)
+
 ;; Update user statistics
 (define-private (update-user-stats (user principal) (cost uint) (penalty uint))
   (let
@@ -200,18 +214,18 @@
 )
 
 ;; Update spot statistics
-(define-private (update-spot-stats (spot-id uint) (revenue uint) (duration uint))
+(define-private (update-spot-stats (validated-spot-id uint) (revenue uint) (duration uint))
   (let
     (
       (current-stats (default-to 
         { total-sessions: u0, total-revenue: u0, average-duration: u0, last-maintenance: u0 }
-        (map-get? spot-statistics { spot-id: spot-id })
+        (map-get? spot-statistics { spot-id: validated-spot-id })
       ))
       (new-sessions (+ (get total-sessions current-stats) u1))
       (new-revenue (+ (get total-revenue current-stats) revenue))
       (new-avg-duration (/ (+ (* (get average-duration current-stats) (get total-sessions current-stats)) duration) new-sessions))
     )
-    (map-set spot-statistics { spot-id: spot-id }
+    (map-set spot-statistics { spot-id: validated-spot-id }
       {
         total-sessions: new-sessions,
         total-revenue: new-revenue,
@@ -228,15 +242,17 @@
 (define-public (add-parking-spot (location (string-ascii 100)) (spot-type uint) (hourly-rate uint))
   (let
     (
-      (spot-id (var-get next-spot-id))
+      (validated-spot-id (var-get next-spot-id))
     )
+    ;; Validate inputs
+    (asserts! (validate-location location) ERR_INVALID_INPUT)
     (asserts! (or (is-eq spot-type SPOT_TYPE_REGULAR)
                   (is-eq spot-type SPOT_TYPE_HANDICAP)
                   (is-eq spot-type SPOT_TYPE_ELECTRIC)
                   (is-eq spot-type SPOT_TYPE_VIP)) ERR_INVALID_SPOT_TYPE)
     (asserts! (> hourly-rate u0) ERR_INVALID_PAYMENT)
     
-    (map-set parking-spots { spot-id: spot-id }
+    (map-set parking-spots { spot-id: validated-spot-id }
       {
         owner: tx-sender,
         location: location,
@@ -250,27 +266,32 @@
       }
     )
     
-    (var-set next-spot-id (+ spot-id u1))
-    (ok spot-id)
+    (var-set next-spot-id (+ validated-spot-id u1))
+    (ok validated-spot-id)
   )
 )
 
 ;; Update parking spot (only owner)
 (define-public (update-parking-spot (spot-id uint) (hourly-rate uint) (is-active bool))
-  (match (map-get? parking-spots { spot-id: spot-id })
-    spot-data (begin
-      (asserts! (is-eq tx-sender (get owner spot-data)) ERR_UNAUTHORIZED)
-      (asserts! (> hourly-rate u0) ERR_INVALID_PAYMENT)
-      
-      (map-set parking-spots { spot-id: spot-id }
-        (merge spot-data { 
-          hourly-rate: hourly-rate,
-          is-active: is-active
-        })
+  (begin
+    ;; Validate inputs
+    (asserts! (validate-spot-id spot-id) ERR_INVALID_INPUT)
+    (asserts! (> hourly-rate u0) ERR_INVALID_PAYMENT)
+    
+    (match (map-get? parking-spots { spot-id: spot-id })
+      spot-data (begin
+        (asserts! (is-eq tx-sender (get owner spot-data)) ERR_UNAUTHORIZED)
+        
+        (map-set parking-spots { spot-id: spot-id }
+          (merge spot-data { 
+            hourly-rate: hourly-rate,
+            is-active: is-active
+          })
+        )
+        (ok true)
       )
-      (ok true)
+      ERR_SPOT_NOT_EXISTS
     )
-    ERR_SPOT_NOT_EXISTS
   )
 )
 
@@ -323,10 +344,12 @@
 (define-public (make-reservation (spot-id uint) (start-time uint) (duration uint))
   (let
     (
-      (reservation-id (var-get next-reservation-id))
+      (validated-reservation-id (var-get next-reservation-id))
       (end-time (+ start-time duration))
       (cost-result (calculate-parking-cost spot-id duration))
     )
+    ;; Validate inputs
+    (asserts! (validate-spot-id spot-id) ERR_INVALID_INPUT)
     (asserts! (<= duration (var-get max-reservation-duration)) ERR_INVALID_TIME)
     (asserts! (>= start-time (get-current-time)) ERR_INVALID_TIME)
     (asserts! (is-spot-available spot-id start-time end-time) ERR_SPOT_OCCUPIED)
@@ -341,7 +364,7 @@
         )
         
         ;; Create reservation
-        (map-set reservations { reservation-id: reservation-id }
+        (map-set reservations { reservation-id: validated-reservation-id }
           {
             user: tx-sender,
             spot-id: spot-id,
@@ -356,13 +379,13 @@
         ;; Update spot with reservation
         (match (map-get? parking-spots { spot-id: spot-id })
           spot-data (map-set parking-spots { spot-id: spot-id }
-            (merge spot-data { reservation-id: (some reservation-id) })
+            (merge spot-data { reservation-id: (some validated-reservation-id) })
           )
           false
         )
         
-        (var-set next-reservation-id (+ reservation-id u1))
-        (ok reservation-id)
+        (var-set next-reservation-id (+ validated-reservation-id u1))
+        (ok validated-reservation-id)
       )
       error-code (err error-code)
     )
@@ -371,195 +394,210 @@
 
 ;; Cancel reservation (with partial refund)
 (define-public (cancel-reservation (reservation-id uint))
-  (match (map-get? reservations { reservation-id: reservation-id })
-    reservation (begin
-      (asserts! (is-eq tx-sender (get user reservation)) ERR_UNAUTHORIZED)
-      (asserts! (get is-active reservation) ERR_RESERVATION_NOT_EXISTS)
-      (asserts! (not (get is-used reservation)) ERR_RESERVATION_NOT_EXISTS)
-      
-      (let
-        (
-          (current-time (get-current-time))
-          (start-time (get start-time reservation))
-          (total-cost (get total-cost reservation))
-          (refund-amount (if (> start-time current-time)
-                           (/ (* total-cost u80) u100) ;; 80% refund if cancelled before start
-                           u0)) ;; No refund if cancelled after start
-        )
+  (begin
+    ;; Validate input
+    (asserts! (validate-reservation-id reservation-id) ERR_INVALID_INPUT)
+    
+    (match (map-get? reservations { reservation-id: reservation-id })
+      reservation (begin
+        (asserts! (is-eq tx-sender (get user reservation)) ERR_UNAUTHORIZED)
+        (asserts! (get is-active reservation) ERR_RESERVATION_NOT_EXISTS)
+        (asserts! (not (get is-used reservation)) ERR_RESERVATION_NOT_EXISTS)
         
-        ;; Refund user
-        (if (> refund-amount u0)
-          (map-set user-balances { user: tx-sender }
-            { balance: (+ (get-user-balance tx-sender) refund-amount) }
+        (let
+          (
+            (current-time (get-current-time))
+            (start-time (get start-time reservation))
+            (total-cost (get total-cost reservation))
+            (refund-amount (if (> start-time current-time)
+                             (/ (* total-cost u80) u100) ;; 80% refund if cancelled before start
+                             u0)) ;; No refund if cancelled after start
           )
-          true
-        )
-        
-        ;; Deactivate reservation
-        (map-set reservations { reservation-id: reservation-id }
-          (merge reservation { is-active: false })
-        )
-        
-        ;; Clear reservation from spot
-        (match (map-get? parking-spots { spot-id: (get spot-id reservation) })
-          spot-data (map-set parking-spots { spot-id: (get spot-id reservation) }
-            (merge spot-data { reservation-id: none })
+          
+          ;; Refund user
+          (if (> refund-amount u0)
+            (map-set user-balances { user: tx-sender }
+              { balance: (+ (get-user-balance tx-sender) refund-amount) }
+            )
+            true
           )
-          false
+          
+          ;; Deactivate reservation
+          (map-set reservations { reservation-id: reservation-id }
+            (merge reservation { is-active: false })
+          )
+          
+          ;; Clear reservation from spot
+          (match (map-get? parking-spots { spot-id: (get spot-id reservation) })
+            spot-data (map-set parking-spots { spot-id: (get spot-id reservation) }
+              (merge spot-data { reservation-id: none })
+            )
+            false
+          )
+          
+          (ok refund-amount)
         )
-        
-        (ok refund-amount)
       )
+      ERR_RESERVATION_NOT_EXISTS
     )
-    ERR_RESERVATION_NOT_EXISTS
   )
 )
 
 ;; Check into parking spot
 (define-public (check-in (spot-id uint))
-  (match (map-get? parking-spots { spot-id: spot-id })
-    spot-data (begin
-      (asserts! (get is-active spot-data) ERR_SPOT_DISABLED)
-      (asserts! (not (get is-occupied spot-data)) ERR_SPOT_OCCUPIED)
-      
-      (let
-        (
-          (current-time (get-current-time))
-          (session-id (var-get next-session-id))
-          (has-reservation (is-some (get reservation-id spot-data)))
-        )
+  (begin
+    ;; Validate input
+    (asserts! (validate-spot-id spot-id) ERR_INVALID_INPUT)
+    
+    (match (map-get? parking-spots { spot-id: spot-id })
+      spot-data (begin
+        (asserts! (get is-active spot-data) ERR_SPOT_DISABLED)
+        (asserts! (not (get is-occupied spot-data)) ERR_SPOT_OCCUPIED)
         
-        ;; If spot has reservation, validate it
-        (if has-reservation
-          (match (get reservation-id spot-data)
-            res-id (match (map-get? reservations { reservation-id: res-id })
-              reservation (begin
-                (asserts! (is-eq tx-sender (get user reservation)) ERR_UNAUTHORIZED)
-                (asserts! (get is-active reservation) ERR_RESERVATION_EXPIRED)
-                (asserts! (<= (get start-time reservation) current-time) ERR_INVALID_TIME)
-                (asserts! (>= (get end-time reservation) current-time) ERR_RESERVATION_EXPIRED)
-                
-                ;; Mark reservation as used
-                (map-set reservations { reservation-id: res-id }
-                  (merge reservation { is-used: true })
+        (let
+          (
+            (current-time (get-current-time))
+            (validated-session-id (var-get next-session-id))
+            (has-reservation (is-some (get reservation-id spot-data)))
+          )
+          
+          ;; If spot has reservation, validate it
+          (if has-reservation
+            (match (get reservation-id spot-data)
+              res-id (match (map-get? reservations { reservation-id: res-id })
+                reservation (begin
+                  (asserts! (is-eq tx-sender (get user reservation)) ERR_UNAUTHORIZED)
+                  (asserts! (get is-active reservation) ERR_RESERVATION_EXPIRED)
+                  (asserts! (<= (get start-time reservation) current-time) ERR_INVALID_TIME)
+                  (asserts! (>= (get end-time reservation) current-time) ERR_RESERVATION_EXPIRED)
+                  
+                  ;; Mark reservation as used
+                  (map-set reservations { reservation-id: res-id }
+                    (merge reservation { is-used: true })
+                  )
+                  true
                 )
-                true
+                false
               )
-              false
+              true
             )
             true
           )
-          true
+          
+          ;; Create parking session
+          (map-set parking-sessions { session-id: validated-session-id }
+            {
+              user: tx-sender,
+              spot-id: spot-id,
+              check-in-time: current-time,
+              check-out-time: none,
+              total-cost: u0,
+              is-completed: false
+            }
+          )
+          
+          ;; Update parking spot
+          (map-set parking-spots { spot-id: spot-id }
+            (merge spot-data {
+              is-occupied: true,
+              current-user: (some tx-sender),
+              check-in-time: (some current-time)
+            })
+          )
+          
+          (var-set next-session-id (+ validated-session-id u1))
+          (ok validated-session-id)
         )
-        
-        ;; Create parking session
-        (map-set parking-sessions { session-id: session-id }
-          {
-            user: tx-sender,
-            spot-id: spot-id,
-            check-in-time: current-time,
-            check-out-time: none,
-            total-cost: u0,
-            is-completed: false
-          }
-        )
-        
-        ;; Update parking spot
-        (map-set parking-spots { spot-id: spot-id }
-          (merge spot-data {
-            is-occupied: true,
-            current-user: (some tx-sender),
-            check-in-time: (some current-time)
-          })
-        )
-        
-        (var-set next-session-id (+ session-id u1))
-        (ok session-id)
       )
+      ERR_SPOT_NOT_EXISTS
     )
-    ERR_SPOT_NOT_EXISTS
   )
 )
 
 ;; Check out of parking spot
 (define-public (check-out (spot-id uint))
-  (match (map-get? parking-spots { spot-id: spot-id })
-    spot-data (begin
-      (asserts! (get is-occupied spot-data) ERR_SPOT_NOT_OCCUPIED)
-      (asserts! (is-eq (some tx-sender) (get current-user spot-data)) ERR_UNAUTHORIZED)
-      
-      (let
-        (
-          (current-time (get-current-time))
-          (check-in-time (unwrap! (get check-in-time spot-data) ERR_INVALID_TIME))
-          (duration (- current-time check-in-time))
-          (cost-result (calculate-parking-cost spot-id duration))
-          (spot-owner (get owner spot-data))
-        )
+  (begin
+    ;; Validate input
+    (asserts! (validate-spot-id spot-id) ERR_INVALID_INPUT)
+    
+    (match (map-get? parking-spots { spot-id: spot-id })
+      spot-data (begin
+        (asserts! (get is-occupied spot-data) ERR_SPOT_NOT_OCCUPIED)
+        (asserts! (is-eq (some tx-sender) (get current-user spot-data)) ERR_UNAUTHORIZED)
         
-        (match cost-result
-          total-cost (begin
-            (let
-              (
-                (user-balance (get-user-balance tx-sender))
-                (penalty (if (> total-cost user-balance) 
-                           (* (var-get penalty-rate) (/ (- total-cost user-balance) (get hourly-rate spot-data)))
-                           u0))
-                (final-cost (+ total-cost penalty))
-                (owner-share (/ (* total-cost u90) u100)) ;; 90% to spot owner
-                (platform-share (- total-cost owner-share)) ;; 10% to platform
-              )
-              
-              ;; Handle payment
-              (if (>= user-balance final-cost)
-                (begin
-                  ;; Sufficient balance - deduct from user
-                  (map-set user-balances { user: tx-sender }
-                    { balance: (- user-balance final-cost) }
-                  )
-                  
-                  ;; Pay spot owner
-                  (map-set user-balances { user: spot-owner }
-                    { balance: (+ (get-user-balance spot-owner) owner-share) }
-                  )
+        (let
+          (
+            (current-time (get-current-time))
+            (check-in-time (unwrap! (get check-in-time spot-data) ERR_INVALID_TIME))
+            (duration (- current-time check-in-time))
+            (cost-result (calculate-parking-cost spot-id duration))
+            (spot-owner (get owner spot-data))
+          )
+          
+          (match cost-result
+            total-cost (begin
+              (let
+                (
+                  (user-balance (get-user-balance tx-sender))
+                  (penalty (if (> total-cost user-balance) 
+                             (* (var-get penalty-rate) (/ (- total-cost user-balance) (get hourly-rate spot-data)))
+                             u0))
+                  (final-cost (+ total-cost penalty))
+                  (owner-share (/ (* total-cost u90) u100)) ;; 90% to spot owner
+                  (platform-share (- total-cost owner-share)) ;; 10% to platform
                 )
-                (begin
-                  ;; Insufficient balance - deduct all available and record penalty
-                  (map-set user-balances { user: tx-sender }
-                    { balance: u0 }
-                  )
-                  
-                  ;; Pay spot owner partial amount
-                  (let ((partial-owner-share (/ (* user-balance u90) u100)))
+                
+                ;; Handle payment
+                (if (>= user-balance final-cost)
+                  (begin
+                    ;; Sufficient balance - deduct from user
+                    (map-set user-balances { user: tx-sender }
+                      { balance: (- user-balance final-cost) }
+                    )
+                    
+                    ;; Pay spot owner
                     (map-set user-balances { user: spot-owner }
-                      { balance: (+ (get-user-balance spot-owner) partial-owner-share) }
+                      { balance: (+ (get-user-balance spot-owner) owner-share) }
+                    )
+                  )
+                  (begin
+                    ;; Insufficient balance - deduct all available and record penalty
+                    (map-set user-balances { user: tx-sender }
+                      { balance: u0 }
+                    )
+                    
+                    ;; Pay spot owner partial amount
+                    (let ((partial-owner-share (/ (* user-balance u90) u100)))
+                      (map-set user-balances { user: spot-owner }
+                        { balance: (+ (get-user-balance spot-owner) partial-owner-share) }
+                      )
                     )
                   )
                 )
+                
+                ;; Update parking spot
+                (map-set parking-spots { spot-id: spot-id }
+                  (merge spot-data {
+                    is-occupied: false,
+                    current-user: none,
+                    check-in-time: none,
+                    reservation-id: none
+                  })
+                )
+                
+                ;; Update statistics
+                (update-user-stats tx-sender final-cost penalty)
+                (update-spot-stats spot-id total-cost duration)
+                
+                (ok { cost: final-cost, duration: duration, penalty: penalty })
               )
-              
-              ;; Update parking spot
-              (map-set parking-spots { spot-id: spot-id }
-                (merge spot-data {
-                  is-occupied: false,
-                  current-user: none,
-                  check-in-time: none,
-                  reservation-id: none
-                })
-              )
-              
-              ;; Update statistics
-              (update-user-stats tx-sender final-cost penalty)
-              (update-spot-stats spot-id total-cost duration)
-              
-              (ok { cost: final-cost, duration: duration, penalty: penalty })
             )
+            error-code (err error-code)
           )
-          error-code (err error-code)
         )
       )
+      ERR_SPOT_NOT_EXISTS
     )
-    ERR_SPOT_NOT_EXISTS
   )
 )
 
@@ -567,6 +605,8 @@
 (define-public (emergency-unlock (spot-id uint))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    ;; Validate input
+    (asserts! (validate-spot-id spot-id) ERR_INVALID_INPUT)
     
     (match (map-get? parking-spots { spot-id: spot-id })
       spot-data (begin
